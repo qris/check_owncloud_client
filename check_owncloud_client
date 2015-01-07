@@ -1,0 +1,170 @@
+#!/usr/bin/env python
+
+import argparse
+import logging
+import socket
+import sys
+
+logger = logging.getLogger('check_owncloud_client')
+logger.addHandler(logging.StreamHandler(sys.stdout))
+
+parser = argparse.ArgumentParser(
+    description="Nagios plugin to check current status of an OwnCloud "
+    "client (on a user's desktop)")
+parser.add_argument(
+    'users', nargs='+', metavar="user", help="the username of the user "
+    "running the client")
+# allowed status codes are listed in SyncFileStatus::toSocketAPIString():
+# https://github.com/owncloud/client/blob/master/src/libsync/syncfilestatus.cpp#L50
+parser.add_argument(
+    '--ok', dest='ok_states', help="the states which should result "
+    "in an OK status in Nagios.", default="SYNC,OK")
+parser.add_argument(
+    '--warning', dest='warning_states', help="the states which should result "
+    "in a WARNING status in Nagios.", default="NEW")
+parser.add_argument(
+    '--error', dest='error_states', help="the states which should result "
+    "in an ERROR status in Nagios.", default="NONE,IGNORE,ERROR,+SWM,NOP")
+# every other state results in an UNKNOWN result
+parser.add_argument(
+    '--minimum-version', dest='min_version', help="the minimum client software "
+    "version to avoid a WARNING status in Nagios.", default="1.8")
+parser.add_argument(
+    '--timeout', dest='timeout', help="the timeout in seconds for a response "
+    "from the ownCloud client", type=int, default=10)
+parser.add_argument(
+    '--debug', help="show internal state and communications with client",
+    action="store_true", default=False)
+
+args = parser.parse_args()
+
+ok_states = args.ok_states.split(',')
+warning_states = args.warning_states.split(',')
+error_states = args.error_states.split(',')
+
+error_reason = None
+warning_reason = None
+unknown_reason = None
+statuses = []
+
+if args.debug:
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.setLevel(logging.INFO)
+
+for username in args.users:
+    # assume the UNIX socket directory, not Mac or Windows. We should probably
+    # use QT functions as SocketApi does, for forwards compatibility:
+    # https://github.com/owncloud/client/blob/master/src/gui/socketapi.cpp#L76
+    conn = socket.socket(socket.AF_UNIX)
+    conn.settimeout(args.timeout)
+
+    def connect(path):
+        logger.debug("Connecting to socket: %s", path)
+        conn.connect(path)
+
+    connect('/tmp/runtime-%s/ownCloud/socket' % username)
+
+    def send(message):
+        logger.debug("Sending command: '%s'", repr(message))
+        conn.send(message + '\n')
+
+    send('VERSION')
+
+    # we're waiting for both VERSION response and unprompted message
+    # REGISTER_PATH
+    waiting_for_results = 2
+    buf = ""
+    root_folder = None
+
+    while waiting_for_results > 0:
+        if '\n' not in buf:
+            received = conn.recv(4096)
+            logger.debug("Received data: %s", repr(received))
+            buf += received
+            continue
+
+        line, _, buf = buf.partition('\n')
+        logger.debug("Processing line: %s (remaining in buffer: %s)",
+            repr(line), repr(buf))
+
+        values = line.split(':')
+        command = values.pop(0)
+
+        if command == 'VERSION':
+            waiting_for_results -= 1
+            mirall_version, socketapi_version = values
+
+            min_version = args.min_version.split('.')
+            for expected, actual in zip(min_version, mirall_version.split('.')):
+                if int(actual) < int(expected):
+                    warning_reason = "%s client version is %s, expected %s" % (
+                        username, repr(mirall_version), repr(args.min_version))
+                    break
+
+            if int(socketapi_version.split('.')[0]) != 1:
+                error_reason = ("%s client version %s has incompatible "
+                    "protocol version %s" % (username, repr(mirall_version),
+                    repr(socketapi_version)))
+
+        elif command == 'REGISTER_PATH':
+            # We need to wait for this message to know what path to request the
+            # status of. Now we know, so send the message.
+            root_folder = values[0]
+            send('RETRIEVE_FOLDER_STATUS:%s' % values[0])
+            # no change to waiting_for_results, because we sent another command
+            # which we're now expecting a response to
+
+        elif command == 'STATUS':
+            # Check whether the status is in either of our lists
+            status = values[0]
+            folder = values[1]
+
+            if root_folder == None:
+                logger.debug("Ignoring STATUS message for %s while root "
+                    "folder is not known yet", repr(folder))
+            elif root_folder != folder:
+                logger.debug("Ignoring STATUS message for folder other than "
+                    "the root folder: %s", repr(folder))
+            else:
+                status_message = "%s folder %s is in %s state" % (username,
+                    repr(folder), repr(status))
+
+                if status in error_states:
+                    error_reason = status_message
+                    status_message += " (error)"
+                elif status in warning_states:
+                    warning_reason = status_message
+                    status_message += " (warning)"
+                elif status in ok_states:
+                    status_message += " (ok)"
+                else:
+                    unknown_reason = status_message
+                    status_message += " (unknown)"
+
+                statuses.append(status_message)
+                waiting_for_results -= 1
+
+        else:
+            logger.debug("Ignoring unknown command %s", repr(command))
+
+        logger.debug("Waiting for %d responses", waiting_for_results)
+
+    logger.debug("Received all responses for %s, disconnecting" % username)
+    conn.close()
+
+if unknown_reason:
+    prefix = 'UNKNOWN: %s' % unknown_reason
+    status_code = 3
+elif error_reason:
+    prefix = 'ERROR: %s' % error_reason
+    status_code = 2
+elif warning_reason:
+    prefix = 'WARNING: %s' % warning_reason
+    status_code = 1
+else:
+    prefix = 'OK'
+    status_code = 0
+
+print "%s (%s)" % (prefix, ", ".join(statuses))
+sys.exit(status_code)
